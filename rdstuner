@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# http://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.DBInstanceClass.html
+# TODO use core count to influence connections?
+# TODO use memory to change set fixed limits?
+# correct as of 05-2014
+
+if [ -z $1 ];then
+  AWS_PROFILE="default"
+else
+  AWS_PROFILE=$1
+fi
+AWS_ARGS="--profile ${AWS_PROFILE}"
+AWS_CLI="aws ${AWS_ARGS}"
+
+# list the instances
+#aws --profile ith rds describe-reserved-db-instances-offerings | jq -r '.ReservedDBInstancesOfferings[].DBInstanceClass' | sort -n | uniq
+
+declare -A db_instance_types
+
+# Cores, mem in GB
+db_instance_types=( ["db.t1.micro"]="1,.615" ["db.m3.medium"]="1,3.75" ["db.m3.large"]="2,7.5" ["db.m3.xlarge"]="4,15" ["db.m3.2xlarge"]="8,30" ["db.m2.xlarge"]="2,17.1" ["db.m2.2xlarge"]="4,34.2" ["db.m2.4xlarge"]="8,68.4" ["db.cr1.8xlarge"]="32,244")
+#db_instance_types=( ["db.t1.micro"]="1,.615" )
+
+gb_to_byte(){
+    memory_in_bytes=$(echo "$1 * 1024 * 1024 * 1024" | bc )
+    echo Memory in bytes: $memory_in_bytes
+}
+
+# don't rely on Amazon calculation method..
+calculate_db_connections(){
+  max_connections=$(echo "$1 / 12582880" | bc )
+  echo Max connections: $max_connections
+}
+
+calculate_work_mem(){
+  # NOTE: work_mem is in kilobytes so * 1024
+  divider=$(echo "$2 * 1024" | bc )
+  work_mem=$(echo "$1 / $divider" | bc )
+  work_mem_setting="{DBInstanceClassMemory/$divider}"
+  echo work_mem: $work_mem
+  echo work_mem_setting: $work_mem_setting
+}
+calculate_maintenance_work_mem(){
+  divider=$(echo "16 * 1024" | bc )
+  # NOTE: maintenance_work_mem is in kilobytes so * 1024
+  maintenance_work_mem=$(echo "$1 / $divider" | bc )
+  maintenance_work_mem_setting="{DBInstanceClassMemory/$divider}"
+  echo maintenance_work_mem: $maintenance_work_mem
+  echo maintenance_work_mem_setting: $maintenance_work_mem_setting
+}
+
+calculate_effective_cache_size(){
+  # NOTE: RDSs unit of measure for effective_cache_size is in 8kB blocks
+  divider=$(echo "100 * 8192" | bc )
+  # 75% over 50% default
+  effective_cache_size=$(echo "$1 * 75 / $divider" | bc )
+  effective_cache_size_setting="{DBInstanceClassMemory*75/$divider}"
+  echo effective_cache_size: $effective_cache_size
+  echo effective_cache_size_setting: $effective_cache_size_setting
+}
+
+# aws identifiers must conform to alpahnumeric and dash notation
+cleanup_aws_id(){
+  echo $1 | sed 's/[\.|_]/-/g'
+}
+
+parse_instance(){
+  echo $1 | cut -d\, -f$2
+}
+
+
+max_connections="200 400 600 1000 1200"
+#max_connections="200"
+
+for max_connection in $max_connections;do
+  for instance in "${!db_instance_types[@]}"; do
+    memory_in_gb=$(parse_instance ${db_instance_types["$instance"]} 2)
+    cores=$(parse_instance ${db_instance_types["$instance"]} 1)
+    echo Cores: $cores
+    echo Memory: ${memory_in_gb}GB
+
+    gb_to_byte $memory_in_gb
+
+    rounded_memory_in_gb=${memory_in_gb%.*}
+
+    calculate_work_mem $memory_in_bytes $max_connection
+    calculate_maintenance_work_mem $memory_in_bytes $max_connection
+    calculate_effective_cache_size $memory_in_bytes
+    group_name=$(cleanup_aws_id "${instance}-${max_connection}con-${rounded_memory_in_gb}gb-${cores}vcpu")
+
+    echo Creating: $group_name
+    $AWS_CLI rds create-db-parameter-group \
+          --db-parameter-group-name $group_name \
+          --db-parameter-group-family postgres9.3 \
+          --description "Pgtuned Postgres config for $max_connection connections, $cores vcpu, ${memory_in_gb}GB"
+
+    $AWS_CLI rds modify-db-parameter-group --db-parameter-group-name $group_name --parameters \
+          "ParameterName=work_mem,ParameterValue=$work_mem_setting,ApplyMethod=pending-reboot " \
+          "ParameterName=maintenance_work_mem,ParameterValue=$maintenance_work_mem_setting,ApplyMethod=pending-reboot " \
+          "ParameterName=effective_cache_size,ParameterValue=$effective_cache_size_setting,ApplyMethod=pending-reboot " \
+          "ParameterName=max_connections,ParameterValue=$max_connection,ApplyMethod=pending-reboot "
+  done
+done
+
+
